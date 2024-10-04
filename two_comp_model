@@ -1,0 +1,89 @@
+import neuron
+from neuron import h, gui
+from neuron.units import ms, mV, µm
+import matplotlib.pyplot as plt
+h.load_file("stdrun.hoc")
+
+# Reset topology
+for sec in h.allsec():
+    h.delete_section(sec=sec)
+
+# Initialize Two Compartment Model
+class TwoCompCell:
+    def __init__(self):
+        self.node = h.Section(name="node")
+        self.inode = h.Section(name="internode")
+        self.inode.connect(self.node(1))
+        self._setup_morphology()
+        self._setup_biophysics()
+
+    def _setup_morphology(self):
+        # Node of Ranvier dimensions
+        self.node.L = 1 * µm  # Node length
+        self.node.diam = 1.5 * µm # Node diameter
+        self.node.nseg = 1 # Number of segments
+
+        # Internode dimensions
+        self.inode.L = 1000 * µm # Internode length
+        self.inode.diam = 1.5 * µm # Same diameter as node
+        self.inode.nseg = 1 # Number of segments
+
+    def _setup_biophysics(self):
+        # Biophysics for first node (Node of Ranvier)
+        self.node.Ra = 70 # Axial resistance (Ohm * cm)
+        self.node.cm = 1 # Membrane capacitance (μF/cm²)
+        self.node.insert("hh")
+        for seg in self.node:
+            seg.hh.gnabar = 1.2 # Sodium conductance (S/cm²)
+            seg.hh.gkbar = 0.36 # Potassium conductance (S/cm²)
+            seg.hh.gl = 0.0001 # Leak conductance (S/cm²)
+            seg.hh.el = -65 * mV # Reversal potential (mV)
+
+        # Biophysics for internode (Myelinated segment)
+        self.inode.Ra = 70 # Axial resistance (Ohm * cm)
+        self.inode.cm = 0.001 # Decreased capacitance
+        self.inode.insert("pas")
+        self.inode.g_pas = 1e-5 # Leak conductance
+        self.inode.e_pas = -65 * mV # Leak reversal potential (mV)
+
+# Attach stimulator (at proximal node)
+def attach_current_clamp(cell, delay=0.5, dur=0.1, amp=0.1, loc=0.0):
+    stim = h.IClamp(cell.node(loc))
+    stim.delay = delay
+    stim.dur = dur
+    stim.amp = amp
+    return stim
+
+# Record from the cell (at both node and internode)
+def set_recording_vectors(cell):
+    node_v_vec = h.Vector() # Membrane potential at node
+    inode_v_vec = h.Vector() # Membrane potential at internode
+    t_vec = h.Vector() # Time vector
+    node_v_vec.record(cell.node(0.5)._ref_v)
+    inode_v_vec.record(cell.inode(1)._ref_v)
+    t_vec.record(h._ref_t)
+    return node_v_vec, inode_v_vec, t_vec
+
+def simulate(tstop=5):
+    h.celsius = 36.0
+    h.tstop = tstop
+    h.finitialize(-65)  # initial membrane potential
+    h.dt = 0.025 * ms # time step
+    h.run()
+
+# Making a cell and running simulation
+two_comp = TwoCompCell()
+
+stim = attach_current_clamp(two_comp, delay=0.5, dur=0.1, amp=0.1, loc=0.0)
+node_v_vec, inode_v_vec, t_vec = set_recording_vectors(two_comp)
+simulate(tstop=3)
+
+# Plotting the results
+plt.figure(figsize=(8, 4))
+plt.plot(t_vec, node_v_vec, label='Node of Ranvier', color='blue')
+plt.plot(t_vec, inode_v_vec, label='Internode', color='red')
+plt.xlabel('Time (ms)')
+plt.ylabel('Membrane Potential (mV)')
+plt.title('Membrane Potential at Node and Internode')
+plt.legend()
+plt.show()
