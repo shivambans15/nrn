@@ -1,0 +1,180 @@
+import numpy as np
+import neuron
+from neuron import h, gui
+from neuron.units import ms, mV, µm
+import matplotlib.pyplot as plt
+h.load_file("stdrun.hoc")
+
+# Reset topology
+for sec in h.allsec():
+    h.delete_section(sec=sec)
+
+# Function to generate cluster positions
+def generate_cluster_positions(length, lambda_cluster): #lambda cluster is avg num of clusters per um
+    positions = []
+    current_position = 0.0
+    while current_position < length:
+        inter_cluster_distance = np.random.exponential(1.0 / lambda_cluster)
+        current_position += inter_cluster_distance
+        if current_position < length:
+            positions.append(current_position)
+    if not positions:
+        positions.append(np.random.uniform(0, length))
+    return positions
+
+# Initialize Two Compartment Model with Inhomogeneous Na+ Channels
+class TwoCompCell:
+    def __init__(self):
+        self.node = h.Section(name="node")
+        self.inode = h.Section(name="internode")
+        self.inode.connect(self.node(1))
+        self._setup_morphology()
+        self._setup_biophysics()
+
+    def _setup_morphology(self):
+        self.node.L = 1 * µm
+        self.node.diam = 1.5 * µm
+        self.node.nseg = 101
+
+        self.inode.L = 1000 * µm
+        self.inode.diam = 1.5 * µm
+        self.inode.nseg = 1
+
+    def _setup_biophysics(self):
+        self.node.Ra = 70
+        self.node.cm = 1
+        self.node.insert("hh")
+        
+        nseg = self.node.nseg
+        seg_length = self.node.L / nseg  # in µm
+        seg_area = np.pi * self.node.diam * seg_length * 1e-8  # cm² per segment
+    
+        # Initialize gnabar array
+        gnabar_array = np.zeros(nseg)
+    
+        # Adjusted cluster parameters
+        cluster_positions = generate_cluster_positions(self.node.L, lambda_cluster=1)  # Define number of clusters
+        cluster_width = 0.01  # Define cluster width
+    
+        # For normalization
+        original_node_area = np.pi * self.node.diam * self.node.L * 1e-8  # Node area in cm²
+        total_conductance = original_node_area * 1.2  # Total conductance (from uniform gnabar)
+    
+        # Distribute gnabar across clusters
+        for cluster_pos in cluster_positions:
+            for i in range(nseg):
+                x = (i + 0.5) / nseg * self.node.L  # Position in µm at segment center
+                distance = x - cluster_pos
+                gnabar_increment = np.exp(-0.5 * (distance / cluster_width) ** 2)
+                gnabar_array[i] += gnabar_increment
+    
+        # Ensure gnabar_array sums to total_conductance
+        # Convert gnabar_array to conductance per segment (in S)
+        gnabar_per_segment = gnabar_array * seg_area
+    
+        # Total conductance before normalization
+        total_gnabar = np.sum(gnabar_per_segment)
+    
+        # Avoid division by zero
+        if total_gnabar == 0:
+            total_gnabar = 1e-12
+    
+        # Compute normalization factor
+        normalization_factor = total_conductance / total_gnabar
+    
+        # Apply normalization
+        gnabar_per_segment *= normalization_factor
+    
+        # Assign values to segments
+        for i, seg in enumerate(self.node):
+            seg.hh.gnabar = gnabar_per_segment[i] / seg_area  # S/cm²
+            seg.hh.gkbar = 0.36
+            seg.hh.gl = 0.0001
+            seg.hh.el = -65 * mV
+    
+        self.inode.Ra = 70
+        self.inode.cm = 0.001
+        self.inode.insert("pas")
+        self.inode.g_pas = 1e-5
+        self.inode.e_pas = -65 * mV
+
+
+def apply_stim(cell, interstim=0.2, total_time=100, stim_dur=0.1, stim_amp=0.1, loc=0.0, delay=0.5):
+    stims = []
+    stim_times_and_amps = []
+    while delay < total_time:
+        stim = h.IClamp(cell.node(loc))
+        stim.delay = delay
+        stim.dur = stim_dur
+        stim.amp = stim_amp
+        stims.append(stim)
+        stim_times_and_amps.append((delay, delay + stim_dur, stim_amp))  # Store start, end, and amplitude
+        delay += interstim
+    return stims, stim_times_and_amps
+
+# Record from the cell (at both node and internode)
+def set_recording_vectors(cell):
+    node_v_vec = h.Vector()
+    inode_v_vec = h.Vector()
+    t_vec = h.Vector()
+    node_v_vec.record(cell.node(0.5)._ref_v)
+    inode_v_vec.record(cell.inode(1)._ref_v)
+    t_vec.record(h._ref_t)
+    return node_v_vec, inode_v_vec, t_vec
+
+def simulate(tstop=10):
+    h.celsius = 36.0
+    h.tstop = tstop
+    h.finitialize(-65)
+    h.dt = 0.025 * ms
+    h.run()
+
+# Generate a baseline with raised bumps for stimuli, with heights based on stimulus amplitude
+def generate_stim_bumps(t_vec, stim_times_and_amps, baseline=-60):
+    stim_bump = np.full(len(t_vec), baseline)
+    for start, end, amp in stim_times_and_amps:
+        for i, t in enumerate(t_vec):
+            if start <= t <= end:
+                stim_bump[i] = baseline + amp * 10  # Scale the bump height by stimulus amplitude
+    return stim_bump
+
+# Making a cell and running simulation
+two_comp = TwoCompCell()
+
+stims, stim_times_and_amps = apply_stim(two_comp, interstim=2, stim_amp=0.02)  # Example with stim_amp=0.15
+node_v_vec, inode_v_vec, t_vec = set_recording_vectors(two_comp)
+simulate(tstop=105)
+
+# Generate the stimulus bumps
+stim_bump = generate_stim_bumps(t_vec, stim_times_and_amps)
+
+# Plotting the results
+plt.figure(figsize=(8, 4))
+plt.plot(t_vec, node_v_vec, label='Node of Ranvier', color='blue')
+plt.plot(t_vec, inode_v_vec, label='Internode', color='red')
+
+# Plot the stimulus bumps
+plt.plot(t_vec, stim_bump, label='Stimulus Applied', color='green')
+
+plt.xlabel('Time (ms)')
+plt.ylabel('Membrane Potential (mV)')
+plt.title('Membrane Potential at Node and Internode with Stimuli')
+plt.ylim(-80, 25)
+plt.legend()
+plt.show()
+
+# Plot gnabar distribution
+gnabar_values = []
+positions = []
+
+for i, seg in enumerate(two_comp.node):
+    positions.append(seg.x * two_comp.node.L / µm)
+    gnabar = seg.hh.gnabar
+    gnabar_values.append(gnabar)
+
+plt.figure(figsize=(12, 6))
+plt.bar(positions, gnabar_values, width=0.005, align='center')
+plt.xlabel('Position along Node (µm)')
+plt.ylabel('gnabar (S/cm²)')
+plt.title('Inhomogeneous Na+ Channel Distribution with Clusters')
+plt.show()
