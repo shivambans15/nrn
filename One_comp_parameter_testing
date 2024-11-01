@@ -1,0 +1,239 @@
+import numpy as np
+from neuron import h
+from neuron.units import ms, mV, µm
+import matplotlib.pyplot as plt
+
+h.load_file("stdrun.hoc")
+for sec in h.allsec():
+    h.delete_section(sec=sec)
+
+def generate_cluster_positions(length, num_clusters=1, positions=None):
+    return positions if positions is not None else np.linspace(0.1 * µm, length - 0.1 * µm, num_clusters)
+
+class OneCompCell:
+    def __init__(self, cluster_positions=None, cluster_width=0.1 * µm):
+        self.node = h.Section(name="node")
+        self.cluster_positions = cluster_positions if cluster_positions is not None else [0.5 * self.node.L]
+        self.cluster_width = cluster_width
+        self._setup_morphology()
+        self._setup_biophysics()
+
+    def _setup_morphology(self):
+        self.node.L = 1 * µm
+        self.node.diam = 1.5 * µm
+        self.node.nseg = 101
+
+    def _setup_biophysics(self):
+        self.node.Ra = 700
+        self.node.cm = 1
+        self.node.insert("hh")
+        nseg = self.node.nseg
+        seg_length = self.node.L / nseg
+        seg_area = np.pi * self.node.diam * seg_length * 1e-8
+        gnabar_array = np.zeros(nseg)
+        total_conductance = np.pi * self.node.diam * self.node.L * 1e-8 * 3
+        sigma = self.cluster_width / 6
+        for cluster_pos in self.cluster_positions:
+            x = (np.arange(nseg) + 0.5) / nseg * self.node.L
+            gnabar_array += np.exp(-0.5 * ((x - cluster_pos) / sigma) ** 2)
+        gnabar_per_segment = gnabar_array * seg_area
+        gnabar_per_segment *= total_conductance / np.sum(gnabar_per_segment)
+        '''for i, seg in enumerate(self.node):
+            seg.hh.gnabar = gnabar_per_segment[i] / seg_area
+            seg.hh.gkbar = 0.36
+            seg.hh.gl = 0.0001
+            seg.hh.el = -65 * mV
+'''
+def apply_stim(cell, stim_amp=0.1, interstim=2, total_time=100, stim_dur=0.1, loc=0.0, delay=0.5):
+    stims, stim_times_and_amps = [], []
+    while delay < total_time:
+        stim = h.IClamp(cell.node(loc))
+        stim.delay, stim.dur, stim.amp = delay, stim_dur, stim_amp
+        stims.append(stim)
+        stim_times_and_amps.append((delay, delay + stim.dur, stim.amp))
+        delay += interstim
+    return stims, stim_times_and_amps
+
+def set_recording_vectors(cell):
+    node_v_vec, t_vec = h.Vector(), h.Vector()
+    node_v_vec.record(cell.node(1.0)._ref_v)
+    t_vec.record(h._ref_t)
+    return node_v_vec, t_vec
+
+def simulate(tstop=105):
+    h.celsius = 36.0
+    h.finitialize(-65)
+    h.tstop = tstop
+    h.dt = 0.025 * ms
+    h.run()
+
+def count_APs(node_v_vec, t_vec, stim_times_and_amps, threshold=30.0):
+    num_APs = 0
+    t_vec_np, node_v_vec_np = np.array(t_vec), np.array(node_v_vec)
+    for i, (start, _, _) in enumerate(stim_times_and_amps):
+        end = stim_times_and_amps[i+1][0] if i + 1 < len(stim_times_and_amps) else t_vec_np[-1]
+        voltages = node_v_vec_np[(t_vec_np >= start) & (t_vec_np < end)]
+        if np.any(voltages >= threshold):
+            num_APs += 1
+    return num_APs
+
+def get_num_APs(stim_amp, one_comp=None):
+    one_comp = one_comp or OneCompCell()
+    stims, stim_times_and_amps = apply_stim(one_comp, stim_amp=stim_amp)
+    node_v_vec, t_vec = set_recording_vectors(one_comp)
+    simulate(tstop=105)
+    num_APs = count_APs(node_v_vec, t_vec, stim_times_and_amps)
+    return num_APs, node_v_vec, t_vec, stim_times_and_amps, one_comp
+
+def generate_stim_bumps(t_vec, stim_times_and_amps, baseline=-60):
+    stim_bump = np.full(len(t_vec), baseline)
+    for start, end, amp in stim_times_and_amps:
+        indices = (t_vec >= start) & (t_vec <= end)
+        stim_bump[indices] = baseline + amp * 10
+    return stim_bump
+
+def simulate_varying_parameter(
+    param_name,
+    param_values,
+    num_peaks=None,
+    cluster_width=None,
+    cluster_positions=None,
+    stim_amp=None,
+    plot_percentage=100
+):
+    num_APs_list = []
+    num_plots = max(1, int(round((plot_percentage / 100.0) * len(param_values))))
+    plot_indices = np.linspace(0, len(param_values) - 1, num_plots).astype(int)
+    gnabar_plotted = False
+
+    for idx, value in enumerate(param_values):
+        kwargs = {
+            'cluster_positions': cluster_positions,
+            'cluster_width': cluster_width,
+            'stim_amp': stim_amp,
+            'num_peaks': num_peaks
+        }
+        if param_name == 'num_peaks':
+            kwargs['num_peaks'] = int(value)
+            kwargs['cluster_positions'] = generate_cluster_positions(length=1 * µm, num_clusters=kwargs['num_peaks'])
+        elif param_name == 'cluster_width':
+            kwargs['cluster_width'] = value
+        elif param_name == 'cluster_positions':
+            kwargs['cluster_positions'] = value
+        elif param_name == 'stim_amp':
+            kwargs['stim_amp'] = value
+        else:
+            raise ValueError(f"Unknown parameter {param_name}")
+
+        # Explicitly handle cluster_positions and cluster_width
+        if kwargs['cluster_positions'] is not None:
+            cluster_positions = kwargs['cluster_positions']
+        else:
+            cluster_positions = generate_cluster_positions(1 * µm, num_clusters=kwargs.get('num_peaks', 1))
+
+        if kwargs['cluster_width'] is not None:
+            cluster_width = kwargs['cluster_width']
+        else:
+            cluster_width = 0.1 * µm
+
+        one_comp = OneCompCell(
+            cluster_positions=cluster_positions,
+            cluster_width=cluster_width
+        )
+
+        num_APs, node_v_vec, t_vec, stim_times_and_amps, _ = get_num_APs(
+            kwargs['stim_amp'] or 0.01, one_comp=one_comp
+        )
+        num_APs_list.append(num_APs)
+
+        if idx in plot_indices:
+            stim_bump = generate_stim_bumps(t_vec, stim_times_and_amps)
+            plt.figure(figsize=(8, 4))
+            plt.plot(t_vec, node_v_vec, label='Node of Ranvier')
+            plt.plot(t_vec, stim_bump, label='Stimulus')
+            plt.xlabel('Time (ms)')
+            plt.ylabel('Membrane Potential (mV)')
+            plt.title(f'Membrane Potential (Param {param_name} = {value})')
+            plt.ylim(-80, 50)
+            plt.legend()
+            plt.show()
+
+        if param_name != 'stim_amp' or not gnabar_plotted:
+            gnabar_values = [seg.hh.gnabar for seg in one_comp.node]
+            positions = [seg.x * one_comp.node.L / µm for seg in one_comp.node]
+            plt.figure(figsize=(12, 6))
+            plt.bar(positions, gnabar_values, width=0.005, align='center')
+            plt.xlabel('Position along Node (µm)')
+            plt.ylabel('gnabar (S/cm²)')
+            plt.title(f'gnabar Distribution{" (Param " + param_name + " = " + str(value) + ")" if param_name != "stim_amp" else ""}')
+            plt.show()
+            if param_name == 'stim_amp':
+                gnabar_plotted = True
+
+    plt.figure()
+    plt.plot(param_values, num_APs_list, marker='o')
+    plt.xlabel(param_name)
+    plt.ylabel('Number of Action Potentials')
+    plt.title(f'Number of APs vs. {param_name}')
+    plt.show()
+
+###### Run it #######
+'''
+# Vary the number of peaks
+num_peaks_values = np.arange(1, 11)  # 1 to 10 peaks
+
+simulate_varying_parameter(
+    param_name='num_peaks',
+    param_values=num_peaks_values,
+    cluster_width=0.1 * µm,           # Constant cluster width
+    stim_amp=0.0035,                  # Constant stimulus amplitude
+    plot_percentage=100               # Plot voltage graphs for all simulations
+)
+'''
+
+
+# Vary cluster width
+cluster_width_values = np.linspace(0.1, 0.8, 10)
+
+simulate_varying_parameter(
+    param_name='cluster_width',
+    param_values=cluster_width_values,
+    num_peaks=3,
+    cluster_positions=[0.5 * µm],
+    stim_amp=0.0035,
+    plot_percentage=100
+)
+
+
+
+'''
+# Vary cluster positions
+cluster_positions_list = [
+    [0.1 * µm],
+    [0.5 * µm],
+    [0.9 * µm],
+]
+
+simulate_varying_parameter(
+    param_name='cluster_positions',
+    param_values=cluster_positions_list,
+    cluster_width=0.1,
+    stim_amp=0.0025,
+    plot_percentage=100
+)
+'''
+
+
+'''
+# Vary stimulus amplitude
+stim_amp_values = np.linspace(0.0015, 0.005, 15)
+
+simulate_varying_parameter(
+    param_name='stim_amp',
+    param_values=stim_amp_values,
+    num_peaks=5,
+    cluster_width=0.1,
+    cluster_positions=[0.2 * µm, 0.4 * µm, 0.6 * µm, 0.8 * µm, 1.0 * µm],
+    plot_percentage=100
+)
+'''
