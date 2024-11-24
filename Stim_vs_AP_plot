@@ -1,3 +1,5 @@
+#https://docs.google.com/presentation/d/1_ch5tUu2vH4B9CrBgOg8ePK56sFFztR2BfQGSGMAGtE/edit#slide=id.p
+
 import numpy as np
 from neuron import h
 from neuron.units import ms, mV, µm
