@@ -1,0 +1,702 @@
+import numpy as np
+from neuron import h
+from neuron.units import ms, mV, µm
+import matplotlib.pyplot as plt
+
+# =============================================================================
+# Papers
+# =============================================================================
+# Rattay, Lutter, Felix 2001: https://www.sciencedirect.com/science/article/pii/S0378595500002562?via%3Dihub#aep-section-id28
+# Hanekmon, 2001: https://journals.lww.com/ear-hearing/abstract/2001/08000/three_dimensional_spiraling_finite_element_model.5.aspx
+# Rattay et al., 2013 - https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0079256
+
+# =============================================================================
+# Simulation Parameters
+# =============================================================================
+simulation_temperature = 36.0 # Temperature in degrees Celsius - COMMON VALUE
+v_init = -65 * mV # Initial membrane potential - COMMON VALUE
+simulation_dt = 0.03 * ms # Simulation time step
+simulation_tstop = 105 * ms # Total simulation time
+
+# =============================================================================
+# Neuron Morphology Paramaters
+# =============================================================================
+node_length = 1 * µm # Length of the node - FROM IMAGING IN LAB
+node_diameter = 1.5 * µm # Diameter of the node - FROM IMAGING IN LAB
+node_nseg = 101 # Number of segments in the node
+
+# =============================================================================
+# Neuron Biophysics Parameters
+# =============================================================================
+axon_Ra = 100 # Axial resistance in ohm*cm - RATTAY, LUTTER, FELIX, 2001
+axon_cm = 1 # Membrane capacitance in uF/cm² - RATTAY, LUTTER, FELIX, 2001
+gkbar_default = 0.36 # Potassium conductance in S/cm² - HANEKMON, 2001
+gl_default = 0.00015 # Leak conductance in S/cm² - RATTAY ET AL., 2013
+el_default = -65 * mV # Leak reversal potential - RATTAY ET AL., 2013
+
+# =============================================================================
+# Cluster Parameters
+# =============================================================================
+default_cluster_width = 0.1 * µm # Default cluster width
+default_conductance = 0.12 # Default average conductance per unit area in S/cm²
+cluster_position_margin = 0.1 * µm # Margin from the ends when generating cluster positions
+sigma_factor = 6 # Number of standard devs around the cluster peak
+
+# =============================================================================
+# Stimulus Parameters
+# =============================================================================
+default_stim_amp = 0 # Default stimulus amplitude in nA
+interstim_interval = 5 # Interval between stimuli in ms
+total_sim_time = 100 # Total time for stimuli in ms
+stim_duration = 0.1 # Duration of each stimulus in ms
+stim_location = 0.0 # Location along the node (0.0 - 1.0)
+stim_start_delay = 0.5 # Initial delay before the first stimulus in ms
+
+# =============================================================================
+# Recording Parameters
+# =============================================================================
+recording_loc = 1.0 # Location along the node where voltage is recorded (0.0 - 1.0)
+
+# =============================================================================
+# AP Detection Parameters
+# =============================================================================
+ap_threshold = 20 # Voltage threshold in mV for detecting action potentials
+
+# =============================================================================
+# Plotting Parameters
+# =============================================================================
+plot_baseline = -80 # Baseline voltage for plots in mV
+stim_bump_height = 5 # Height of stimulus indicator bumps in mV
+plot_figsize_v = (8, 4) # Figure size for voltage plots
+plot_ylim_v = (-80, 100) # Y-axis limits for voltage plots
+plot_figsize_gnabar = (12, 6) # Figure size for conductance plots
+bar_width = 0.005 # Bar width for conductance plots
+
+# =============================================================================
+# Initialize Neuron
+# =============================================================================
+h.load_file("stdrun.hoc")
+for sec in h.allsec():
+    h.delete_section(sec=sec)
+
+# =============================================================================
+# Define the Cell
+# =============================================================================
+class OneCompCell:
+    def __init__(
+        self,
+        conductance=default_conductance,
+        cluster_details=None,
+        normalize=False
+    ):
+        """
+        Parameters:
+        - cluster_details: XXX
+        - conductance: Average conductance per unit area (gnabar in S/cm²)
+        - normalize: If True, scales conductances to maintain average gnabar; else, uses cluster_heights directly
+        """
+        self.node = h.Section(name="node")
+        self.cluster_details = cluster_details
+        self.conductance = conductance
+        self.normalize = normalize
+        self._setup_morphology()
+        self._setup_biophysics()
+        
+    def _setup_morphology(self):
+        self.node.L = node_length
+        self.node.diam = node_diameter
+        self.node.nseg = node_nseg
+
+    def _setup_biophysics(self):
+        self.node.Ra = axon_Ra
+        self.node.cm = axon_cm
+        self.node.insert("hh")
+        nseg = self.node.nseg
+        x = (np.arange(nseg) + 0.5) / nseg * self.node.L  # Segment positions in µm
+        gnabar_array = np.zeros(nseg)  # Initialize gnabar values for all segments
+    
+        # Process each cluster individually
+        for pos, height, width in self.cluster_details:
+            sigma = width / sigma_factor  # Calculate the spread for the Gaussian
+            gnabar_array += height * np.exp(-0.5 * ((x - pos) / sigma) ** 2)
+    
+        if self.normalize:
+            # Scale gnabar_array so that its average equals self.conductance
+            average_gnabar = np.mean(gnabar_array)
+            if average_gnabar > 0:  # Prevent division by zero
+                scaling_factor = self.conductance / average_gnabar
+                gnabar_array *= scaling_factor
+    
+        # Assign calculated gnabar to each segment
+        for i, seg in enumerate(self.node):
+            seg.hh.gnabar = gnabar_array[i]
+            seg.hh.gkbar = gkbar_default
+            seg.hh.gl = gl_default
+            seg.hh.el = el_default
+
+
+# =============================================================================
+# Apply Stim Function
+# =============================================================================
+def apply_stim(
+    cell,
+    stim_amp=default_stim_amp,
+    interstim=interstim_interval,
+    total_time=total_sim_time,
+    stim_dur=stim_duration,
+    loc=stim_location,
+    delay=stim_start_delay,
+    std_dev=0.005,  # Standard deviation for Gaussian sampling
+    seed=None      # Seed for reproducibility
+):
+    """
+    Apply randomized stimulus events to the cell.
+    
+    Parameters:
+    - cell: The cell object to stimulate.
+    - stim_amp: Mean stimulus amplitude in nA.
+    - interstim: Interval between stimuli in ms.
+    - total_time: Total time for stimuli in ms.
+    - stim_dur: Duration of each stimulus in ms.
+    - loc: Location along the node (0.0 - 1.0).
+    - delay: Initial delay before the first stimulus in ms.
+    - std_dev: Standard deviation for Gaussian sampling of stim amplitudes.
+    - seed: Random seed for reproducibility across clusters.
+    
+    Returns:
+    - stims: List of stimulus objects.
+    - stim_times_and_amps: List of (start, end, amp) for each stimulus.
+    """
+    stims, stim_times_and_amps = [], []
+
+    # Set the random seed for reproducibility
+    rng = np.random.default_rng(seed)
+
+    while delay < total_time:
+        # Sample the amplitude from a Gaussian distribution
+        sampled_amp = rng.normal(loc=stim_amp, scale=std_dev)
+        sampled_amp = max(sampled_amp, 0)  # Ensure amplitude is non-negative
+
+        stim = h.IClamp(cell.node(loc))
+        stim.delay = delay
+        stim.dur = stim_dur
+        stim.amp = sampled_amp
+        stims.append(stim)
+        stim_times_and_amps.append((delay, delay + stim.dur, sampled_amp))
+        delay += interstim
+
+    return stims, stim_times_and_amps
+
+# =============================================================================
+# Recording Vector Function
+# =============================================================================
+def set_recording_vectors(cell):
+    node_v_vec = h.Vector()
+    t_vec = h.Vector()
+    node_v_vec.record(cell.node(recording_loc)._ref_v)  # Record at the specified location
+    t_vec.record(h._ref_t)
+    return node_v_vec, t_vec
+
+# =============================================================================
+# Run Simulation Function
+# =============================================================================
+def simulate(tstop=simulation_tstop):
+    h.celsius = simulation_temperature
+    h.finitialize(v_init)
+    h.tstop = tstop
+    h.dt = simulation_dt
+    h.run()
+
+# =============================================================================
+# Count APs Function
+# =============================================================================
+def count_APs(node_v_vec, t_vec, threshold=ap_threshold):
+    node_v_vec_np = np.array(node_v_vec)
+    above_threshold = node_v_vec_np >= threshold  # Boolean array where True indicates voltage above threshold
+    upward_crossings = np.where(
+        (above_threshold[1:] == True) & (above_threshold[:-1] == False)
+    )[0]  # Indices where voltage crosses from below to above threshold
+    num_APs = len(upward_crossings)
+    return num_APs
+
+# =============================================================================
+# Wrapper Function to Run it and Get Number of APs and Recording/Time Vectors
+# =============================================================================
+def get_num_APs_random(
+    stim_amp,
+    one_comp=None,
+    std_dev=0.01,
+    seed=None
+):
+    """
+    Wrapper to simulate a cell with randomized stim amplitudes for each event.
+    
+    Parameters:
+    - stim_amp: Base stimulus amplitude in nA.
+    - one_comp: The cell model to simulate.
+    - std_dev: Standard deviation for Gaussian sampling of stim amplitudes.
+    - seed: Random seed for consistent randomization across clusters.
+    
+    Returns:
+    - num_APs: Number of action potentials detected.
+    - node_v_vec: Recorded voltage vector.
+    - t_vec: Recorded time vector.
+    - stim_times_and_amps: List of (start, end, amp) for each stimulus.
+    """
+    one_comp = one_comp()
+    stims, stim_times_and_amps = apply_stim(
+        one_comp,
+        stim_amp=stim_amp,
+        std_dev=std_dev,
+        seed=seed
+    )
+    node_v_vec, t_vec = set_recording_vectors(one_comp)
+    simulate()
+    num_APs = count_APs(node_v_vec, t_vec, threshold=ap_threshold)
+    return num_APs, node_v_vec, t_vec, stim_times_and_amps, one_comp
+
+# =============================================================================
+# Plotting Functions
+# =============================================================================
+def plot_stim_amp_vs_AP_overlay_with_random_stims(
+    stim_amp_values,
+    cluster_details_list,
+    conductance=default_conductance,
+    normalize=False,
+    std_dev=0.01,
+    ap_plot_title="Stimulus Amplitude vs. Average Number of Action Potentials",
+    gnabar_plot_title="Overlay: $g_{Na}$ Distributions for Cluster Configurations",
+    seed=None,
+    cluster_idx=0,  # Index of the cluster configuration to visualize
+    stim_amp_to_plot=None,  # Stimulus amplitude to visualize
+    legend_labels=None  # List of legend labels
+):
+    """
+    Plot AP count vs. stim_amp with randomized stim amplitudes and overlay gnabar distributions.
+    Also, visualize the stimuli distribution for each stimulus.
+    """
+    plt.figure(figsize=(10, 6))
+
+    # Dictionary to store stimuli data for each cluster configuration
+    stim_data = {}
+
+    for idx, cluster_details in enumerate(cluster_details_list):
+        avg_APs_list = []
+        stim_data_per_cluster = {}
+
+        for stim_idx, stim_amp in enumerate(stim_amp_values):
+            # Consistent randomization by setting the seed
+            random_seed = seed or stim_idx
+
+            # Create the neuron model
+            one_comp = OneCompCell(
+                cluster_details=cluster_details,
+                conductance=conductance,
+                normalize=normalize
+            )
+
+            # Run the simulation with randomized stims
+            num_APs, _, _, stim_times_and_amps, _ = get_num_APs_random(
+                stim_amp=stim_amp,
+                one_comp=lambda: one_comp,
+                std_dev=std_dev,
+                seed=random_seed
+            )
+            avg_APs_list.append(num_APs)
+
+            # Store stim_times_and_amps
+            stim_data_per_cluster[stim_amp] = stim_times_and_amps
+
+        # Store the stim_data for this cluster configuration
+        stim_data[idx] = stim_data_per_cluster
+
+        # Determine the label for this cluster configuration
+        if legend_labels is not None and idx < len(legend_labels):
+            label = legend_labels[idx]
+        else:
+            label = f"Cluster Config {idx + 1}"
+
+        # Plot results for this cluster configuration
+        plt.plot(
+            stim_amp_values,
+            avg_APs_list,
+            marker='o',
+            label=label
+        )
+
+    plt.xlabel("Stimulus Amplitude (nA)")
+    plt.ylabel("Number of Action Potentials")
+    plt.yticks(range(0, 21))
+    plt.title(ap_plot_title)
+    plt.legend(title="Cluster Configurations")
+    plt.grid(True)
+    plt.show()
+
+    # Plot 2: Overlay gnabar distributions
+    plt.figure(figsize=(10, 6))
+    colors = plt.cm.viridis(np.linspace(0, 1, len(cluster_details_list)))
+    for idx, (cluster_details, color) in enumerate(zip(cluster_details_list, colors)):
+        # Create the neuron model
+        one_comp = OneCompCell(
+            cluster_details=cluster_details,
+            conductance=conductance,
+            normalize=normalize
+        )
+
+        # Extract gnabar values for the node
+        gnabar_values = [seg.hh.gnabar for seg in one_comp.node]
+        positions = [seg.x * one_comp.node.L / µm for seg in one_comp.node]
+
+        # Determine the label for this cluster configuration
+        if legend_labels is not None and idx < len(legend_labels):
+            label = legend_labels[idx]
+        else:
+            label = f"Cluster Config {idx + 1}"
+
+        # Plot gnabar distribution
+        plt.fill_between(
+            positions,
+            gnabar_values,
+            label=label,
+            color=color,
+            alpha=0.5  # Adjust transparency
+        )
+
+    plt.xlabel("Position along Node (µm)")
+    plt.ylabel("$g_{Na}$ (S/cm²)")
+    plt.title(gnabar_plot_title)
+    plt.legend(title="Cluster Configurations")
+    plt.grid(True)
+    plt.show()
+
+    # Visualize Stimuli Distribution for a Selected Cluster Configuration and Stimulus Amplitude
+    if stim_amp_to_plot is None:
+        stim_amp_to_plot = stim_amp_values[len(stim_amp_values)//2]  # Default to middle value
+
+    # Ensure stim_amp_to_plot is in stim_amp_values
+    stim_amp_to_plot = min(stim_amp_values, key=lambda x: abs(x - stim_amp_to_plot))
+
+    # Determine the label for the selected cluster configuration
+    if legend_labels is not None and cluster_idx < len(legend_labels):
+        cluster_label = legend_labels[cluster_idx]
+    else:
+        cluster_label = f"Cluster Config {cluster_idx + 1}"
+
+    # Get the stimuli data
+    stim_times_and_amps = stim_data[cluster_idx][stim_amp_to_plot]
+
+    # Extract times and amplitudes
+    times = [(start + end) / 2 for start, end, amp in stim_times_and_amps]
+    amps = [amp for start, end, amp in stim_times_and_amps]
+
+    # Plot Stimuli Amplitudes Over Time
+    plt.figure(figsize=(10, 6))
+    plt.plot(times, amps, 'ro-', label='Stimulus Amplitude (nA)')
+    plt.xlabel('Time (ms)')
+    plt.ylabel('Stimulus Amplitude (nA)')
+    plt.title(f'Stimuli Amplitudes over Time for {cluster_label} at Stim Amp {stim_amp_to_plot}')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Voltage Plot
+    cluster_details = cluster_details_list[cluster_idx]
+    one_comp = OneCompCell(
+        cluster_details=cluster_details,
+        conductance=conductance,
+        normalize=normalize
+    )
+
+    num_APs, node_v_vec, t_vec, stim_times_and_amps, _ = get_num_APs_random(
+        stim_amp=stim_amp_to_plot,
+        one_comp=lambda: one_comp,
+        std_dev=std_dev,
+        seed=seed
+    )
+
+    plot_voltage_and_stimuli(
+        node_v_vec,
+        t_vec,
+        stim_times_and_amps,
+        title=f'Voltage Trace with Stimuli for {cluster_label} at Stim Amp {stim_amp_to_plot}'
+    )
+
+# Plot voltage and stimuli
+def plot_voltage_and_stimuli(node_v_vec, t_vec, stim_times_and_amps, title="Voltage and Stimuli over Time"):
+    """
+    Plots the voltage trace and overlays the stimuli events.
+    
+    Parameters:
+    - node_v_vec: Recorded voltage vector.
+    - t_vec: Recorded time vector.
+    - stim_times_and_amps: List of (start, end, amp) for each stimulus.
+    - title: Plot title.
+    """
+    import matplotlib.pyplot as plt
+    node_v_vec_np = np.array(node_v_vec)
+    t_vec_np = np.array(t_vec)
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    ax1.plot(t_vec_np, node_v_vec_np, label='Voltage (mV)', color='blue')
+    ax1.set_xlabel('Time (ms)')
+    ax1.set_ylabel('Voltage (mV)', color='blue')
+    ax1.tick_params(axis='y', labelcolor='blue')
+
+    # Plot stimuli amplitudes on a secondary y-axis
+    ax2 = ax1.twinx()
+    times = [(start + end) / 2 for start, end, amp in stim_times_and_amps]
+    amps = [amp for start, end, amp in stim_times_and_amps]
+    ax2.plot(times, amps, 'ro', label='Stimulus Amplitude (nA)')
+    ax2.set_ylabel('Stimulus Amplitude (nA)', color='red')
+    ax2.tick_params(axis='y', labelcolor='red')
+
+    fig.tight_layout()
+    plt.title(title)
+    plt.grid(True)
+    plt.show()
+
+
+# =============================================================================
+# Running it!
+# =============================================================================
+#Set stim amp values
+stim_amp_values = np.linspace(0,0.15,20)  # nA
+# cluster_details_list = [
+#     [(0.5 * µm, 0.05, 0.1 * µm)],
+#     [(0.05 * µm, 0.05, 0.1 * µm), (0.3 * µm, 0.05, 0.1 * µm)],
+#     [(0.5 * µm, 0.05, 0.1 * µm)],
+# ]
+
+# Set cluster configurations
+cluster_details_list = []
+for num_clusters in (1, 5, 10, 20):  # 1 to 5 clusters
+    spacing = node_length / num_clusters  # Even spacing along the node
+    clusters = [
+        (i * spacing + spacing / 2, 0.3, 0.1 * µm)  # (position, height, width)
+        for i in range(num_clusters)
+    ]
+    cluster_details_list.append(clusters)
+
+#Set legened labels
+legend_labels = [
+    '1 Cluster',
+    '5 Clusters',
+    '10 Clusters',
+    '20 Clusters'
+]
+
+def simulate_probability_distribution(
+    stim_amp,
+    cluster_details,
+    num_simulations=1000,
+    epoch_duration=5000,  # ms
+    interstim=5,  # ms
+    std_dev=0.01,
+    seed=None
+):
+    """
+    Simulates firing probabilities for a given stimulus amplitude and cluster configuration.
+    Plots a histogram of firing probabilities.
+
+    Parameters:
+    - stim_amp: Mean stimulus amplitude in nA.
+    - cluster_details: Cluster configuration details.
+    - num_simulations: Number of simulations to run.
+    - epoch_duration: Duration of each simulation epoch in ms.
+    - interstim: Interval between stimuli in ms.
+    - std_dev: Standard deviation for Gaussian sampling of stim amplitudes.
+    - seed: Random seed for consistent randomization.
+
+    Returns:
+    - probabilities: List of firing probabilities across simulations.
+    """
+    probabilities = []
+
+    for sim_idx in range(num_simulations):
+        # Set a unique seed for each simulation for reproducibility
+        current_seed = seed + sim_idx if seed is not None else None
+
+        # Create the neuron model
+        one_comp = OneCompCell(
+            cluster_details=cluster_details,
+            conductance=default_conductance,
+            normalize=False
+        )
+
+        # Apply stimuli and record
+        stims, stim_times_and_amps = apply_stim(
+            one_comp,
+            stim_amp=stim_amp,
+            interstim=interstim,
+            total_time=epoch_duration,
+            std_dev=std_dev,
+            seed=current_seed
+        )
+        node_v_vec, t_vec = set_recording_vectors(one_comp)
+
+        # Run the simulation
+        simulate(tstop=epoch_duration)
+
+        # Count APs and calculate firing probability
+        num_APs = count_APs(node_v_vec, t_vec, threshold=ap_threshold)
+        num_stimuli = len(stim_times_and_amps)
+        probability = num_APs / num_stimuli if num_stimuli > 0 else 0
+        probabilities.append(probability)
+
+    # Plot histogram of probabilities
+    plt.figure(figsize=(10, 6))
+    plt.hist(probabilities, bins=30, edgecolor='black')
+    plt.xlabel('Firing Probability')
+    plt.ylabel('Count')
+    plt.title(f'Firing Probability Distribution\nStim Amp: {stim_amp} nA, Clusters: {len(cluster_details)}')
+    plt.grid(True)
+    plt.show()
+
+    return probabilities
+
+
+
+
+from scipy.interpolate import interp1d
+import numpy as np
+import matplotlib.pyplot as plt
+
+def simulate_and_plot_distributions(
+    stim_amp,
+    cluster_details_list,
+    num_simulations=1000,
+    epoch_duration=5000,  # ms
+    interstim=5,  # ms
+    std_dev=0.01,
+    base_seed=42,  # Base seed for reproducibility
+    legend_labels=None  # Labels for the legend
+):
+    """
+    Simulates firing probabilities for different cluster configurations.
+    Plots overlaid smoothed density-like curves for all cluster configurations.
+
+    Parameters:
+    - stim_amp: Mean stimulus amplitude in nA.
+    - cluster_details_list: List of cluster configuration details.
+    - num_simulations: Number of simulations to run.
+    - epoch_duration: Duration of each simulation epoch in ms.
+    - interstim: Interval between stimuli in ms.
+    - std_dev: Standard deviation for Gaussian sampling of stim amplitudes.
+    - base_seed: Base seed for generating unique seeds for each simulation.
+    - legend_labels: List of labels for the legend (one for each cluster configuration).
+
+    Returns:
+    - None
+    """
+    plt.figure(figsize=(10, 6))
+    results = []  # Collect results for consolidated printing at the end
+
+    for cluster_idx, cluster_details in enumerate(cluster_details_list):
+        probabilities = []
+
+        for sim_idx in range(num_simulations):
+            # Generate a unique seed for each simulation
+            current_seed = base_seed + sim_idx
+
+            # Create the neuron model
+            one_comp = OneCompCell(
+                cluster_details=cluster_details,
+                conductance=default_conductance,
+                normalize=False
+            )
+
+            # Apply stimuli and record
+            stims, stim_times_and_amps = apply_stim(
+                one_comp,
+                stim_amp=stim_amp,
+                interstim=interstim,
+                total_time=epoch_duration,
+                std_dev=std_dev,
+                seed=current_seed  # Use the unique seed
+            )
+            node_v_vec, t_vec = set_recording_vectors(one_comp)
+
+            # Run the simulation
+            simulate(tstop=epoch_duration)
+
+            # Count APs and calculate firing probability
+            num_APs = count_APs(node_v_vec, t_vec, threshold=ap_threshold)
+            num_stimuli = len(stim_times_and_amps)
+            probability = num_APs / num_stimuli if num_stimuli > 0 else 0
+            probabilities.append(probability)
+
+        # Bin the probabilities (from 0.0 to 1.0 with finer bins)
+        bin_edges = np.linspace(0.0, 1.0, 20)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+        counts, _ = np.histogram(probabilities, bins=bin_edges)
+
+        # Filter to start printing from the first non-zero bin
+        non_zero_results = [(bin_center, count) for bin_center, count in zip(bin_centers, counts) if count > 0]
+        label = legend_labels[cluster_idx] if legend_labels and cluster_idx < len(legend_labels) else f"Cluster Config {cluster_idx + 1}"
+        results.append((label, non_zero_results))
+
+        # Smooth curve
+        if len(bin_centers[counts > 0]) > 1:
+            smooth_function = interp1d(
+                bin_centers, counts, kind='cubic', fill_value="extrapolate"
+            )
+            x_smooth = np.linspace(0.0, 1.0, 500)  # Smooth range
+            y_smooth = smooth_function(x_smooth)
+
+            y_smooth = np.maximum(y_smooth, 0)  # Clip negative values to zero
+
+            # Plot the smoothed curve
+            plt.plot(x_smooth, y_smooth, label=label)
+        else:
+            plt.plot(bin_centers, counts, linestyle='-', marker='o', label=label)
+
+    # Add labels, legend, and grid
+    plt.xlabel('Firing Probability')
+    plt.ylabel('Count')
+    plt.title('Firing Probability Distributions for Different Clusters')
+    plt.xlim(0.0, 1.0)  # Restrict x-axis to [0.0, 1.0]
+    plt.grid(True)
+    plt.legend(title="Cluster Configurations")
+    plt.show()
+
+    # Consolidated printing of results
+    print("\nResults:")
+    for label, data in results:
+        print(f"\n{label}:")
+        for bin_center, count in data:
+            print(f"Probability: {bin_center:.3f}, Count: {count}")
+
+# =============================================================================
+# Example Usage
+# =============================================================================
+stim_amp = 0.12  # nA
+
+cluster_details_list = []
+for num_clusters in (1, 5, 10, 20):  # 1 to 5 clusters
+    spacing = node_length / num_clusters  # Even spacing along the node
+    clusters = [
+        (i * spacing + spacing / 2, 0.3, 0.1 * µm)  # (position, height, width)
+        for i in range(num_clusters)
+    ]
+    cluster_details_list.append(clusters)
+
+legend_labels = [
+    '1 Cluster',
+    '5 Clusters',
+    '10 Clusters',
+    '20 Clusters'
+]
+
+num_simulations = 500 # number of simulations
+epoch_duration = 500 # ms
+
+simulate_and_plot_distributions(
+    stim_amp=stim_amp,
+    cluster_details_list=cluster_details_list,
+    num_simulations=num_simulations,
+    epoch_duration=epoch_duration,
+    interstim=5,
+    std_dev=0.05,
+    base_seed=42,
+    legend_labels=legend_labels
+)
